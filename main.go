@@ -2,35 +2,46 @@ package main
 
 import (
 	"bufio"
-	"bytes"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
 	"os/exec"
-	"runtime"
-	"unsafe"
 
 	"github.com/gin-gonic/gin"
 	"github.com/joho/godotenv"
+	"github.com/shirou/gopsutil/mem"
 	"github.com/shirou/gopsutil/process"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 )
 
 type Company struct {
-	Id string `json:"id"`
-	Name string `json:"name"`
+	Id           string `json:"id"`
+	Name         string `json:"name"`
 	SchemaSuffix string `json:"schema_suffix"`
 }
 
+type CompanyWithCommand struct {
+	Company Company
+	Command exec.Cmd
+}
+
+type CompanyWithRamUsage struct {
+	Name     string `json:"name"`
+	RamUsage uint64 `json:"ram_usage"`
+}
+
+type CompanyCmd map[string]struct {
+	Company Company
+	Cmd     *exec.Cmd
+}
+
 func main() {
-	var m runtime.MemStats
-	runtime.ReadMemStats(&m)
-	err := godotenv.Load()
-	if err != nil {
+	if err := godotenv.Load(); err != nil {
 		panic(err)
 	}
+
 
 	OmnioDb, err := gorm.Open(postgres.Open(GenerateDsn(
 		os.Getenv("DB_HOST"),
@@ -49,50 +60,64 @@ func main() {
 		panic(error)
 	}
 
-	var commands = []exec.Cmd{}
+	//make a structure where the key is a string and values a couple of key called 'company' for company structure and 'cmd' for exec.cmd structure
+	var companyCmds = make(CompanyCmd)
 
 	r := gin.Default()
-	r.GET("/ping", func(c *gin.Context) {
+	r.GET("/info", func(c *gin.Context) {
+		v, _ := mem.VirtualMemory()
 		c.JSON(http.StatusOK, gin.H{
-			"companies": companies,
-			"queues": unsafe.Sizeof(&commands),
-			"memory": m.Alloc,
+			"companies": GenerateResponse(&companyCmds),
+			"total":     v.Total,
+			"free":      v.Free,
+			"used":      v.Used,
 		})
 	})
 	fmt.Println("running commands now")
-	go runQueues(companies, &commands)
+	//go runQueues(companies, &commands)
+	GenerateCompanyCmd(&companyCmds, companies)
+	//go runQueues(&companyCmds)
 	r.Run(":8080")
 }
 
-func runQueues(companies []Company, commands *[]exec.Cmd) {
-	//for each company run a command 'php artisan --queue=the_company_name'
-	cmd := exec.Command("php", "artisan", "queue:work")
-	*commands = append(*commands, *cmd)
-
-	fmt.Println("running queue for default")
-	go runDefaultQueue(&(*commands)[0])
-	for index, company := range companies {
-		fmt.Println("running queue for: ", company.SchemaSuffix)
-		cmd := exec.Command("php", "artisan", "queue:work", "--queue", company.SchemaSuffix)
-		*commands = append(*commands, *cmd)
-		go runDefaultQueue(&(*commands)[index+1])
+func GenerateCompanyCmd(compCmd *CompanyCmd, companies []Company) {
+	fmt.Println("generaring Company Cmd")
+	var newcompCmd = make(CompanyCmd)
+	for _, company := range companies {
+		newcompCmd[company.SchemaSuffix] = struct {
+			Company Company
+			Cmd     *exec.Cmd
+		}{company, runCommand([]string{"php", "artisan", "queue:work", "--queue", company.SchemaSuffix})}
 	}
+	*compCmd = newcompCmd
 }
 
-func runDefaultQueue(cmd *exec.Cmd) {
-	/* err := cmd.Start()
-	if err != nil {
-		log.Fatal(err)
+func GenerateResponse(companyCmds *CompanyCmd) []CompanyWithRamUsage {
+	companiesWithHisRamUsage := []CompanyWithRamUsage{}
+	//for each all make
+	for _, companyCmd := range *companyCmds {
+		fmt.Println("company is: ", &companyCmd.Company.Name)
+		fmt.Println("cmd id: ", companyCmd.Cmd)
+		fmt.Println("cmd process: ", companyCmd.Cmd.Process)
+		fmt.Println("cmd PID: ", companyCmd.Cmd.Process.Pid)
+		var companyWithHisRamUsage = CompanyWithRamUsage{}
+		companyWithHisRamUsage.Name = companyCmd.Company.Name
+		process, err := process.NewProcess(int32(companyCmd.Cmd.Process.Pid))
+		if err != nil {
+			log.Fatal(err)
+		}
+		processInfo, err := process.MemoryInfo()
+		if err != nil {
+			log.Fatal(err)
+		}
+		companyWithHisRamUsage.RamUsage = uint64(processInfo.RSS)
+		companiesWithHisRamUsage = append(companiesWithHisRamUsage, companyWithHisRamUsage)
 	}
-	err = cmd.Wait()
-	if err != nil {
-		log.Fatal(err)
-	}
-	usage := cmd.ProcessState.SysUsage()
-	fmt.Printf("Memory usage: %v\n", usage) */
+	return companiesWithHisRamUsage
+}
 
-
-
+func runCommand(command []string) *exec.Cmd {
+	cmd := exec.Command(command[0], command[1:]...)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		log.Fatal(err)
@@ -102,77 +127,30 @@ func runDefaultQueue(cmd *exec.Cmd) {
 		log.Fatal(err)
 	}
 	scanner := bufio.NewScanner(stdout)
-	for scanner.Scan() {
-		line := scanner.Text()
-		fmt.Println(line)
-		// Measure memory usage here
-		var m runtime.MemStats
-		runtime.ReadMemStats(&m)
-		fmt.Printf("Memory usage: %v bytes\n", m.Alloc)
-		// Calculate memory usage
-
-		p, err := process.NewProcess(int32(cmd.Process.Pid))
-		if err != nil {
-			log.Fatal(err)
-		}
-		memInfo, err := p.MemoryInfo()
-		if err != nil {
-			log.Fatal(err)
-		}
-		fmt.Printf("Memory Usage: %d bytes\n", memInfo.RSS)
-
-		/* if memory, error := calculateMemory(cmd.Process.Pid); error != nil {
-			fmt.Println(error)
-		} else {
-			fmt.Printf("Memory usage by PID: %v bytes\n", memory)
-		} */
-		// Break the loop if needed
-		// if someCondition {
-		//     break
-		// }
-	}
-	err = cmd.Wait()
-	if err != nil {
-		log.Fatal(err)
-	}
-	fmt.Println("Command finished executing")
-
-	/* output, err := cmd.CombinedOutput()
-
-	if err != nil {
-		fmt.Println(string(output))
-		fmt.Println(err)
-	} */
-}
-
-func GenerateDsn(host, port, username, password, database string) string{
-	return fmt.Sprintf("postgresql://%s:%s@%s:%s/%s", username, password, host, port, database)
-}
-
-func calculateMemory(pid int) (uint64, error) {
-	//file, err := os.Open(fmt.Sprintf("/proc/%d/status", pid))
-	file, err := os.Open(fmt.Sprintf("/proc/%d/smaps", pid))
-	if err != nil {
-		return 0, err
-	}
-	defer file.Close()
-
-	res := uint64(0)
-	pfx := [] byte("VmRSS:")
-	r := bufio.NewScanner(file)
-	for r.Scan() {
-		line := r.Bytes()
-		if bytes.HasPrefix(line, pfx) {
-			var size uint64
-			_, err := fmt.Sscanf(string(line[len(pfx):]), "%d", &size)
+	go func() {
+		for scanner.Scan() {
+			line := scanner.Text()
+			fmt.Println(line)
+			// Calculate memory usage
+			p, err := process.NewProcess(int32(cmd.Process.Pid))
 			if err != nil {
-				return 0, err
+				log.Fatal(err)
 			}
-			res += size
+			memInfo, err := p.MemoryInfo()
+			if err != nil {
+				log.Fatal(err)
+			}
+			fmt.Printf("Memory Usage: %d bytes\n", memInfo.RSS)
 		}
-	}
-	if err := r.Err(); err != nil {
-		return 0, err
-	}
-	return res, nil
+		err = cmd.Wait()
+		if err != nil {
+			log.Fatal(err)
+		}
+	}()
+	fmt.Println("Command finished executing")
+	return cmd
+}
+
+func GenerateDsn(host, port, username, password, database string) string {
+	return fmt.Sprintf("postgresql://%s:%s@%s:%s/%s", username, password, host, port, database)
 }
